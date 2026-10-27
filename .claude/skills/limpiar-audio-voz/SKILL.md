@@ -1,6 +1,6 @@
 ---
 name: limpiar-audio-voz
-description: Limpia grabaciones y aísla la voz trabajando siempre a 48 kHz (nunca baja a 16 kHz). Cadena con ffmpeg, eliminación de zumbido de 60 Hz, WPE multicanal para el eco/reverberación, DeepFilterNet3 con post-filtro para aislar la voz, noisereduce con perfil de los frames más silenciosos, mezcla en seco contra el sonido robótico, EQ/compresión de podcast, expander por energía para atenuar voces de fondo lejanas y normalización a -16 LUFS. Úsala cuando pidan limpiar un audio, quitar ruido, eco o zumbido, quitar voces de fondo, aislar o mejorar la voz de una grabación, entrevista, podcast o vídeo.
+description: Limpia grabaciones y aísla la voz trabajando siempre a 48 kHz (nunca baja a 16 kHz). Cadena con ffmpeg, eliminación de zumbido de 60 Hz, WPE multicanal para el eco/reverberación, DeepFilterNet3 con post-filtro para aislar la voz, noisereduce con perfil de los frames más silenciosos, mezcla en seco contra el sonido robótico, EQ/compresión de podcast, expander por energía para atenuar voces de fondo lejanas, tratamiento e igualado de nivel de tramos con una voz principal lejana y normalización a -16 LUFS. Úsala cuando pidan limpiar un audio, quitar ruido, eco o zumbido, quitar voces de fondo, aislar o mejorar la voz de una grabación, entrevista, podcast o vídeo.
 ---
 
 # Limpiar audio y aislar la voz
@@ -42,12 +42,15 @@ estándar de podcast/redes (-16 LUFS).
 6. **Mezcla en seco**: sumar la señal tras WPE (sin red neuronal) a **-20 dB**.
    Devuelve armónicos que DFN3 y noisereduce se comen y quita el timbre
    "robótico" o "bajo el agua". Más alto (-18) = más natural pero más fondo.
-7. **EQ/compresión de podcast** (ffmpeg): pasa-altos 80 Hz, -2 dB en 280 Hz
-   (barro), +2.5 dB en 3.5 kHz (presencia/nitidez), +1.5 dB shelf en 9 kHz
-   (aire), compresor 2.5:1 suave y de-esser. Va **antes** del expander: si
-   el compresor va después, vuelve a subir el fondo.
+7. **EQ/compresión de podcast** (ffmpeg). Perfil `fuerte` (por defecto, voz
+   con cuerpo y presencia): pasa-altos 90 Hz, -3 dB en 280 Hz (barro), +4 dB
+   en 3 kHz (presencia/nitidez), +2 dB shelf en 8 kHz (aire), compresor
+   3.5:1 y de-esser. Perfil `suave`: -2 dB / +2.5 dB en 3.5 kHz / +1.5 dB,
+   compresor 2.5:1. Va **antes** del expander: si el compresor va después,
+   vuelve a subir el fondo.
 8. **Expander por energía** para las voces lejanas (ver abajo).
-9. **Limitador + `loudnorm`** a -16 LUFS en dos pasadas (I=-16, TP=-1.5,
+9. **Tramos de voz principal lejana** (opcional, `--voz-lejana`, ver abajo).
+10. **Limitador + `loudnorm`** a -16 LUFS en dos pasadas (I=-16, TP=-1.5,
    LRA=11) y salida a 48 kHz. Sin el limitador previo el pico verdadero
    impide llegar al objetivo y se queda ~1 dB corto.
 
@@ -72,6 +75,31 @@ expander atenúa lo que queda muy por debajo de la voz principal:
 
 Límite físico: un expander sólo baja el fondo **en las pausas**; lo que suena
 a la vez que la voz principal sólo lo puede reducir DeepFilterNet3.
+
+### Voz principal lejana o baja (`--voz-lejana`)
+
+En entrevistas es habitual que una de las voces principales esté más lejos
+del micrófono: suena más baja y, en relación con ella, las voces de fondo
+pesan mucho más (en la prueba de referencia ese tramo tenía DNSMOS BAK 2.9
+frente a 3.9 en los de la otra voz, y salía 4–5 dB más bajo). Si el usuario
+indica qué tramos son de esa voz (p. ej. "voz 1 del inicio al 8, voz 2 del
+8 al 37, voz 1 del 37 al final"), pasar los tramos de la voz lejana:
+
+```bash
+python .claude/skills/limpiar-audio-voz/scripts/limpiar_voz.py entrada.wav salida.wav --voz-lejana 8-37
+```
+
+En esos tramos el script:
+- Hace una **2.ª pasada de DeepFilterNet3** (sólo ahí; en voces cercanas
+  vuelve la voz artificial sin ganar mucho).
+- Baja la **mezcla en seco a -30 dB** (`--seco-lejana`): la señal en seco
+  trae el fondo, que en esos tramos pesa más.
+- **Iguala el nivel** de esa voz al del resto (nivel de la mitad más fuerte
+  de los frames de 20 ms), con fundidos de 200 ms en los cortes.
+
+Resultado de referencia en el tramo lejano: BAK 2.89 → 3.34, nivel igualado
+(+8 dB antes de normalizar), a cambio de algo de naturalidad (SIG 2.75 → 2.59).
+Formato: `INICIO-FIN` en segundos, separados por comas; `37-` = hasta el final.
 
 ### Lo que NO conviene hacer
 
@@ -122,7 +150,10 @@ Opciones útiles:
 | `--sin-postfiltro` | off | DeepFilterNet3 sin post-filtro (menos supresión) |
 | `--nr` | `0.6` | Fuerza de noisereduce (0–1). No pasar de 0.6 |
 | `--seco` | `-20` | dB de señal tras WPE mezclada de vuelta; `-99` = nada |
+| `--podcast` | `fuerte` | Perfil de EQ/compresión: `fuerte` o `suave` |
 | `--sin-podcast` | off | Sin EQ/compresión/de-esser |
+| `--voz-lejana` | — | Tramos (s) de una voz principal lejana/baja, p. ej. `8-37` |
+| `--seco-lejana` | `-30` | Mezcla en seco en esos tramos |
 | `--expander` | `fuerte` | `fuerte`, `suave` o `no` |
 | `--lufs` | `-16` | Sonoridad integrada objetivo |
 | `--guardar-intermedios` | off | Guarda cada etapa para comparar |
@@ -143,8 +174,10 @@ python .claude/skills/limpiar-audio-voz/scripts/medir_dnsmos.py --modelo sig_bak
 ```
 
 Referencia (entrevista con dos voces y voces de fondo lejanas, 44.1 kHz
-estéreo): original SIG 1.75 / BAK 1.33; cadena por defecto SIG 2.77 /
-BAK 3.16 / OVRL 2.21 antes de normalizar.
+estéreo): original SIG 1.75 / BAK 1.33 / OVRL 1.30; cadena por defecto
+SIG 2.73 / BAK 3.06 / OVRL 2.14; con `--voz-lejana 8-37` SIG 2.70 /
+BAK 3.31 / OVRL 2.21. Medir también **por tramos** (cada voz por separado):
+la media global esconde que una voz quede mucho peor que la otra.
 
 ## Verificación
 
@@ -163,8 +196,8 @@ Escucha siempre el resultado.
   defecto); si ya está, bajar `--seco` a -24 (la mezcla en seco también trae
   algo de fondo).
 - **Se cortan los finales de palabra** → `--expander suave`.
-- **Una voz principal queda atenuada** → está muy por debajo de la otra;
-  usar `--expander suave` o `--expander no`.
+- **Una voz principal queda baja o con mucho fondo detrás** → marcar sus
+  tramos con `--voz-lejana`; si aun así el expander la recorta, `--expander suave`.
 - **Eco sigue presente** → subir `--wpe-taps` a 15 (peor timbre por encima).
 - **Zumbido persiste** → comprobar si es de 50 Hz (`--hum 50`).
 - **Salida no está a 48 kHz** → falta `-ar 48000` tras `loudnorm`.

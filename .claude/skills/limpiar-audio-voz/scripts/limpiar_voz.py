@@ -7,6 +7,8 @@ Cadena: ffmpeg (decodificar + quitar zumbido, conservando los canales)
         -> mezcla en seco de la señal tras WPE (quita el sonido "robótico")
         -> EQ/compresión/de-esser de podcast
         -> expander por energía (atenúa voces lejanas/de fondo)
+        -> [tramos --voz-lejana: 2.ª pasada DFN3, menos mezcla en seco
+            y nivel igualado al resto]
         -> limitador + loudnorm -16 LUFS.
 
 Uso:
@@ -27,14 +29,22 @@ import soundfile as sf
 
 SR = 48000  # Nunca bajar a 16 kHz.
 
-# EQ de podcast: limpia graves, quita "barro" en 280 Hz, presencia en 3.5 kHz,
-# un poco de aire, compresión suave y de-esser.
-PODCAST = ("highpass=f=80:poles=2,"
-           "equalizer=f=280:t=q:w=1.2:g=-2,"
-           "equalizer=f=3500:t=q:w=1.0:g=2.5,"
-           "highshelf=f=9000:g=1.5,"
-           "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=150:knee=6:makeup=3,"
-           "deesser=i=0.3:f=0.55")
+# EQ de podcast: limpia graves, quita "barro" en 280 Hz, presencia en 3-3.5 kHz,
+# un poco de aire, compresión y de-esser. "fuerte" da más cuerpo y presencia.
+PODCAST = {
+    "suave": ("highpass=f=80:poles=2,"
+              "equalizer=f=280:t=q:w=1.2:g=-2,"
+              "equalizer=f=3500:t=q:w=1.0:g=2.5,"
+              "highshelf=f=9000:g=1.5,"
+              "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=150:knee=6:makeup=3,"
+              "deesser=i=0.3:f=0.55"),
+    "fuerte": ("highpass=f=90:poles=2,"
+               "equalizer=f=280:t=q:w=1.2:g=-3,"
+               "equalizer=f=3000:t=q:w=1.0:g=4,"
+               "highshelf=f=8000:g=2,"
+               "acompressor=threshold=-26dB:ratio=3.5:attack=8:release=120:knee=6:makeup=5,"
+               "deesser=i=0.35:f=0.55"),
+}
 
 # Expander: umbral relativo al nivel local de la voz principal.
 EXPANDER = {
@@ -130,9 +140,49 @@ def mezclar_seco(entrada, seco, salida, db):
     escribir(salida, x[:n] + s[:n] * 10 ** (db / 20))
 
 
-def aplicar_podcast(entrada, salida):
-    run(["ffmpeg", "-y", "-i", str(entrada), "-af", PODCAST, "-ar", str(SR),
+def aplicar_podcast(entrada, salida, perfil):
+    run(["ffmpeg", "-y", "-i", str(entrada), "-af", PODCAST[perfil], "-ar", str(SR),
          "-c:a", "pcm_f32le", str(salida)])
+
+
+def parsear_tramos(texto):
+    """'8-37,50-60' -> [(8.0, 37.0), (50.0, 60.0)]; fin vacío = hasta el final."""
+    tramos = []
+    for parte in filter(None, texto.split(",")):
+        ini, fin = parte.split("-")
+        tramos.append((float(ini), float(fin) if fin else None))
+    return tramos
+
+
+def mascara_tramos(n, tramos, fundido=0.2):
+    """1 dentro de los tramos, 0 fuera, con fundidos de coseno de `fundido` s."""
+    m = np.zeros(n)
+    for ini, fin in tramos:
+        m[int(ini * SR):int(fin * SR) if fin is not None else n] = 1.0
+    k = int(fundido * SR) | 1
+    ventana = np.hanning(k)
+    return np.clip(np.convolve(m, ventana / ventana.sum(), mode="same"), 0, 1)
+
+
+def nivel_voz_db(x):
+    """Nivel de la voz: RMS de la mitad más fuerte de los frames de 20 ms."""
+    f = int(0.02 * SR)
+    e = (x[: len(x) // f * f].reshape(-1, f) ** 2).mean(axis=1)
+    return 10 * np.log10(e[e >= np.median(e)].mean() + 1e-12)
+
+
+def combinar_voz_lejana(normal, lejana, salida, tramos):
+    """Usa la versión 'lejana' en los tramos dados y la iguala en nivel al resto."""
+    x, y = leer(normal), leer(lejana)
+    n = min(len(x), len(y))
+    x, y = x[:n], y[:n]
+    m = mascara_tramos(n, tramos)
+    dentro, fuera = m > 0.99, m < 0.01
+    ganancia = 0.0
+    if dentro.any() and fuera.any():
+        ganancia = nivel_voz_db(x[fuera]) - nivel_voz_db(y[dentro])
+    print(f"    voz lejana: +{ganancia:.1f} dB para igualarla al resto")
+    escribir(salida, x * (1 - m) + y * 10 ** (ganancia / 20) * m)
 
 
 def aplicar_expander(entrada, salida, bajo_pico, ratio, rango, hold, release,
@@ -230,6 +280,13 @@ def main():
     p.add_argument("--seco", type=float, default=-20.0,
                    help="dB de señal tras WPE mezclada de vuelta (-99 = nada)")
     p.add_argument("--sin-podcast", action="store_true", help="sin EQ/compresión")
+    p.add_argument("--podcast", choices=["fuerte", "suave"], default="fuerte",
+                   help="perfil de EQ/compresión")
+    p.add_argument("--voz-lejana", default="",
+                   help="tramos en segundos con la voz principal lejana o baja, "
+                        "p. ej. '8-37' o '8-37,50-': más supresión y nivel igualado")
+    p.add_argument("--seco-lejana", type=float, default=-30.0,
+                   help="mezcla en seco (dB) en los tramos de --voz-lejana")
     p.add_argument("--expander", choices=["fuerte", "suave", "no"], default="fuerte")
     p.add_argument("--lufs", type=float, default=-16.0)
     p.add_argument("--guardar-intermedios", action="store_true")
@@ -242,7 +299,7 @@ def main():
         tmp = Path(tmp)
         e = {k: tmp / f"{k}.wav" for k in (
             "01_sin_zumbido", "02_wpe", "03_dfn3", "04_nr", "05_seco",
-            "06_podcast", "07_expander")}
+            "06_podcast", "07_expander", "08_combinado")}
 
         print("1/8 Decodificando a 48 kHz y quitando zumbido...")
         decodificar_sin_zumbido(a.entrada, e["01_sin_zumbido"], a.hum, a.wpe_mono)
@@ -257,33 +314,44 @@ def main():
         print("3/8 DeepFilterNet3 (aislar voz)...")
         aplicar_deepfilternet3(e["02_wpe"], e["03_dfn3"], not a.sin_postfiltro)
 
-        print("4/8 noisereduce (perfil de frames silenciosos)...")
-        aplicar_noisereduce(e["03_dfn3"], e["04_nr"], a.nr)
+        def terminar(dfn, seco_db, sufijo):
+            """Etapas 4-7 a partir de una salida de DFN3."""
+            nr_, seco_, pod_, exp_ = (tmp / f"{k}{sufijo}.wav" for k in (
+                "04_nr", "05_seco", "06_podcast", "07_expander"))
+            aplicar_noisereduce(dfn, nr_, a.nr)
+            mezclar_seco(nr_, e["02_wpe"], seco_, seco_db)
+            if a.sin_podcast:
+                shutil.copy(seco_, pod_)
+            else:
+                aplicar_podcast(seco_, pod_, a.podcast)
+            if a.expander == "no":
+                shutil.copy(pod_, exp_)
+            else:
+                aplicar_expander(pod_, exp_, **EXPANDER[a.expander])
+            return exp_
 
-        print(f"5/8 Mezcla en seco a {a.seco} dB...")
-        mezclar_seco(e["04_nr"], e["02_wpe"], e["05_seco"], a.seco)
+        print(f"4-7/8 noisereduce, mezcla en seco ({a.seco} dB), "
+              f"podcast ({'no' if a.sin_podcast else a.podcast}), "
+              f"expander ({a.expander})...")
+        final = terminar(e["03_dfn3"], a.seco, "")
 
-        if a.sin_podcast:
-            print("6/8 EQ de podcast omitida")
-            shutil.copy(e["05_seco"], e["06_podcast"])
-        else:
-            print("6/8 EQ, compresión y de-esser de podcast...")
-            aplicar_podcast(e["05_seco"], e["06_podcast"])
-
-        if a.expander == "no":
-            print("7/8 Expander omitido")
-            shutil.copy(e["06_podcast"], e["07_expander"])
-        else:
-            print(f"7/8 Expander ({a.expander}) para voces de fondo...")
-            aplicar_expander(e["06_podcast"], e["07_expander"], **EXPANDER[a.expander])
+        tramos = parsear_tramos(a.voz_lejana)
+        if tramos:
+            print(f"    Tramos de voz lejana {a.voz_lejana}: 2.ª pasada DFN3, "
+                  f"seco {a.seco_lejana} dB...")
+            dfn2 = tmp / "03_dfn3_x2.wav"
+            aplicar_deepfilternet3(e["03_dfn3"], dfn2, not a.sin_postfiltro)
+            lejana = terminar(dfn2, a.seco_lejana, "_lejana")
+            combinar_voz_lejana(final, lejana, e["08_combinado"], tramos)
+            final = e["08_combinado"]
 
         print(f"8/8 Limitador y normalización a {a.lufs} LUFS...")
-        normalizar(e["07_expander"], a.salida, a.lufs)
+        normalizar(final, a.salida, a.lufs)
 
         if a.guardar_intermedios:
             destino = a.salida.with_name(a.salida.stem + "_etapas")
             destino.mkdir(parents=True, exist_ok=True)
-            for f in e.values():
+            for f in sorted(tmp.glob("*.wav")):
                 shutil.copy(f, destino / f.name)
             print(f"Intermedios guardados en {destino}")
 

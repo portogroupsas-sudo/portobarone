@@ -1,42 +1,87 @@
 ---
 name: limpiar-audio-voz
-description: Limpia grabaciones y aísla la voz trabajando siempre a 48 kHz (nunca baja a 16 kHz). Cadena con ffmpeg, eliminación de zumbido de 60 Hz, WPE para el eco/reverberación, DeepFilterNet3 para aislar la voz, noisereduce suave con perfil de los frames más silenciosos y normalización a -16 LUFS. Úsala cuando pidan limpiar un audio, quitar ruido, eco o zumbido, aislar o mejorar la voz de una grabación, entrevista, podcast o vídeo.
+description: Limpia grabaciones y aísla la voz trabajando siempre a 48 kHz (nunca baja a 16 kHz). Cadena con ffmpeg, eliminación de zumbido de 60 Hz, WPE multicanal para el eco/reverberación, DeepFilterNet3 con post-filtro para aislar la voz, noisereduce con perfil de los frames más silenciosos, mezcla en seco contra el sonido robótico, EQ/compresión de podcast, expander por energía para atenuar voces de fondo lejanas y normalización a -16 LUFS. Úsala cuando pidan limpiar un audio, quitar ruido, eco o zumbido, quitar voces de fondo, aislar o mejorar la voz de una grabación, entrevista, podcast o vídeo.
 ---
 
 # Limpiar audio y aislar la voz
 
-Cadena de procesado para dejar una voz limpia, sin zumbido, con poco eco y a
-volumen estándar de podcast/redes (-16 LUFS).
+Cadena de procesado para dejar una voz limpia, nítida "de podcast", sin
+zumbido, con poco eco, con las voces de fondo lejanas atenuadas y a volumen
+estándar de podcast/redes (-16 LUFS).
 
 ## Regla innegociable: 48 kHz en todo momento
 
 - Todo el procesado se hace a **48 000 Hz**. **Nunca** remuestrear a 16 kHz
-  (ni a 22.05/24/44.1 kHz) en ningún paso intermedio ni en la salida.
+  (ni a 22.05/24/44.1 kHz) en ningún paso intermedio ni en la salida. Si la
+  entrada viene a 44.1 kHz se **sube** a 48 kHz al decodificar.
 - DeepFilterNet3 trabaja nativamente a 48 kHz: no hace falta (ni se debe)
   bajar la frecuencia para él.
 - `loudnorm` de ffmpeg sobremuestrea internamente a 192 kHz; por eso la salida
   **siempre** lleva `-ar 48000` explícito.
-- Formato intermedio: WAV mono `pcm_f32le` (float 32) para no perder rango ni
+- Formato intermedio: WAV float 32 (`pcm_f32le`) para no perder rango ni
   provocar clipping entre etapas.
 - Al terminar, verifica con `ffprobe` que la salida es 48000 Hz.
+- Única excepción: la medición opcional con DNSMOS (ver "Medir la calidad")
+  analiza una **copia** a 16 kHz; el audio entregado nunca se toca.
 
 ## Orden de la cadena (y por qué)
 
-1. **Decodificar con ffmpeg → WAV mono float 48 kHz.** Acepta cualquier entrada
-   (mp3, m4a, mp4, mov, wav…).
-2. **Quitar zumbido de 60 Hz** (filtros lineales de ffmpeg): notch en 60 Hz y
-   armónicos (120, 180, 240, 300 Hz) + pasa-altos suave a 60 Hz para el rumble.
-   Si la grabación es de una red de 50 Hz (Europa), cambiar a 50/100/150/200/250.
-3. **WPE (nara_wpe) para el eco/reverberación.** Va antes que los denoisers
-   porque WPE es un predictor lineal y necesita la señal sin procesar de forma
-   no lineal.
-4. **DeepFilterNet3 para aislar la voz.** Modelo `DeepFilterNet3`, a 48 kHz.
-5. **noisereduce suave** con perfil de ruido tomado de los **frames más
-   silenciosos** (no de los primeros segundos): `stationary=True`,
-   `prop_decrease≈0.5`. Sólo pule el ruido residual; si se sube mucho aparecen
-   artefactos "acuáticos".
-6. **Normalizar a -16 LUFS** con `loudnorm` en dos pasadas (I=-16, TP=-1.5,
-   LRA=11) y salida a 48 kHz.
+1. **Decodificar con ffmpeg a 48 kHz float, conservando los canales.** Acepta
+   cualquier entrada (mp3, m4a, mp4, mov, wav…). Si es estéreo se mantiene
+   estéreo para el paso 3.
+2. **Quitar zumbido de 60 Hz**: notch en 60 Hz y armónicos (120–300 Hz) +
+   pasa-altos suave a 60 Hz. Para red de 50 Hz (Europa) usar `--hum 50`.
+3. **WPE (nara_wpe) multicanal para el eco.** Con estéreo, WPE quita bastante
+   más reverberación que sobre la mezcla mono (10 taps, delay 3, 5
+   iteraciones). Va antes que los denoisers porque es un predictor lineal y
+   necesita la señal sin procesar de forma no lineal. Después se mezcla a mono.
+4. **DeepFilterNet3 con post-filtro** para aislar la voz: suprime más el
+   ruido y las voces de fondo que van por debajo de la voz principal.
+5. **noisereduce** con perfil de los **frames más silenciosos** (no de los
+   primeros segundos): `stationary=True`, `prop_decrease=0.6`. No pasar de 0.6.
+6. **Mezcla en seco**: sumar la señal tras WPE (sin red neuronal) a **-20 dB**.
+   Devuelve armónicos que DFN3 y noisereduce se comen y quita el timbre
+   "robótico" o "bajo el agua". Más alto (-18) = más natural pero más fondo.
+7. **EQ/compresión de podcast** (ffmpeg): pasa-altos 80 Hz, -2 dB en 280 Hz
+   (barro), +2.5 dB en 3.5 kHz (presencia/nitidez), +1.5 dB shelf en 9 kHz
+   (aire), compresor 2.5:1 suave y de-esser. Va **antes** del expander: si
+   el compresor va después, vuelve a subir el fondo.
+8. **Expander por energía** para las voces lejanas (ver abajo).
+9. **Limitador + `loudnorm`** a -16 LUFS en dos pasadas (I=-16, TP=-1.5,
+   LRA=11) y salida a 48 kHz. Sin el limitador previo el pico verdadero
+   impide llegar al objetivo y se queda ~1 dB corto.
+
+### Expander para voces de fondo
+
+Las voces de fondo suenan más bajas y lejanas que las principales; el
+expander atenúa lo que queda muy por debajo de la voz principal:
+
+- Detección en la banda de voz (150–4000 Hz), envolvente RMS de 10 ms.
+- **Umbral relativo al nivel local** de la voz principal (percentil 90 en una
+  ventana de ~4 s), no un umbral fijo: si una de las voces principales habla
+  más bajo o más lejos, un umbral global la hundiría.
+- **Hold causal** (sólo después de la voz) + **release** para no cortar el
+  final de las palabras, y **lookahead** de 15–20 ms para no comerse los
+  ataques. Un hold simétrico deja la puerta abierta casi siempre en habla
+  densa y el expander no hace nada.
+
+| Perfil | Umbral bajo el nivel local | Ratio | Atenuación máx. | Hold | Release |
+|---|---|---|---|---|---|
+| `fuerte` (por defecto) | 5 dB | 6:1 | 35 dB | 50 ms | 120 ms |
+| `suave` | 10 dB | 3:1 | 15 dB | 100 ms | 200 ms |
+
+Límite físico: un expander sólo baja el fondo **en las pausas**; lo que suena
+a la vez que la voz principal sólo lo puede reducir DeepFilterNet3.
+
+### Lo que NO conviene hacer
+
+- **Supresión espectral de reverberación tardía** (modelo exponencial
+  Lebart/Habets, resta de la cola) después de DFN3: quita algo más de eco,
+  pero deja la voz claramente robótica (DNSMOS SIG bajó de 2.86 a 2.35 en
+  pruebas). WPE multicanal + mezcla en seco da mejor equilibrio.
+- WPE con muchos taps (20) o delay 2: más eco quitado pero peor timbre.
+- Encadenar dos pasadas de DeepFilterNet3: más fondo quitado, voz más
+  artificial.
 
 ## Instalación
 
@@ -45,19 +90,25 @@ volumen estándar de podcast/redes (-16 LUFS).
 sudo apt-get install -y ffmpeg        # macOS: brew install ffmpeg
 
 # Python
-pip install numpy soundfile nara_wpe noisereduce deepfilternet
+pip install numpy scipy soundfile nara_wpe noisereduce deepfilternet torch torchaudio
+# opcional, para medir la calidad
+pip install onnxruntime
 ```
 
-Nota DeepFilterNet: con torchaudio ≥ 2.2 puede fallar
-`from torchaudio.backend.common import AudioMetaData`. Si ocurre, instalar
-`torch<2.2 torchaudio<2.2` en el entorno virtual.
+Notas DeepFilterNet:
+- Con torchaudio ≥ 2.2 falla `from torchaudio.backend.common import
+  AudioMetaData`; el script lo resuelve creando ese módulo vacío antes de
+  importar `df`. Con torchaudio ≥ 2.9 tampoco existen `torchaudio.info`/`load`,
+  por eso el script lee y escribe con soundfile y llama a `enhance` directamente.
+- Si la descarga del modelo falla (403 a `github.com`), bajarlo de
+  `https://raw.githubusercontent.com/Rikorose/DeepFilterNet/main/models/DeepFilterNet3.zip`
+  y descomprimirlo en `~/.cache/DeepFilterNet/` (debe quedar
+  `~/.cache/DeepFilterNet/DeepFilterNet3/config.ini`).
 
 ## Uso rápido
 
-El script incluido ejecuta la cadena completa:
-
 ```bash
-python .claude/skills/limpiar-audio-voz/scripts/limpiar_voz.py entrada.mp4 salida.wav
+python .claude/skills/limpiar-audio-voz/scripts/limpiar_voz.py entrada.wav salida.wav
 ```
 
 Opciones útiles:
@@ -66,77 +117,34 @@ Opciones útiles:
 |---|---|---|
 | `--hum` | `60` | Frecuencia de red (usar `50` en Europa) |
 | `--sin-wpe` | off | Saltar WPE si la sala ya está seca |
-| `--wpe-taps` | `10` | Más taps = más reverberación eliminada (y más lento) |
-| `--nr` | `0.5` | Fuerza de noisereduce (0–1). Mantener ≤ 0.6 |
+| `--wpe-taps` | `10` | Más taps = más eco quitado (y timbre peor) |
+| `--wpe-mono` | off | WPE sobre la mezcla mono aunque la entrada sea estéreo |
+| `--sin-postfiltro` | off | DeepFilterNet3 sin post-filtro (menos supresión) |
+| `--nr` | `0.6` | Fuerza de noisereduce (0–1). No pasar de 0.6 |
+| `--seco` | `-20` | dB de señal tras WPE mezclada de vuelta; `-99` = nada |
+| `--sin-podcast` | off | Sin EQ/compresión/de-esser |
+| `--expander` | `fuerte` | `fuerte`, `suave` o `no` |
 | `--lufs` | `-16` | Sonoridad integrada objetivo |
 | `--guardar-intermedios` | off | Guarda cada etapa para comparar |
 
-## Pasos manuales (referencia)
+Para entregar varias versiones a comparar, lo habitual es una con
+`--expander suave` y otra con el perfil por defecto.
 
-### 1–2. Decodificar y quitar zumbido
+## Medir la calidad (DNSMOS)
 
-```bash
-ffmpeg -y -i entrada.ext -vn -ac 1 -ar 48000 \
-  -af "highpass=f=60:poles=2,\
-equalizer=f=60:t=q:w=30:g=-30,equalizer=f=120:t=q:w=30:g=-25,\
-equalizer=f=180:t=q:w=30:g=-20,equalizer=f=240:t=q:w=30:g=-15,\
-equalizer=f=300:t=q:w=30:g=-12" \
-  -c:a pcm_f32le 01_sin_zumbido.wav
-```
-
-### 3. WPE (48 kHz)
-
-Ventana STFT de 2048 / salto 512 (≈43 ms / 10.7 ms a 48 kHz):
-
-```python
-import numpy as np, soundfile as sf
-from nara_wpe.wpe import wpe
-from nara_wpe.utils import stft, istft
-
-y, sr = sf.read("01_sin_zumbido.wav", dtype="float32")
-assert sr == 48000
-Y = stft(y[np.newaxis, :], size=2048, shift=512).transpose(2, 0, 1)  # (F, C, T)
-Z = wpe(Y, taps=10, delay=3, iterations=3, statistics_mode="full")
-z = istft(Z.transpose(1, 2, 0), size=2048, shift=512)[0, : len(y)]
-sf.write("02_wpe.wav", z, 48000, subtype="FLOAT")
-```
-
-### 4. DeepFilterNet3
-
-```python
-from df.enhance import enhance, init_df, load_audio, save_audio
-model, df_state, _ = init_df(model_base_dir="DeepFilterNet3")
-assert df_state.sr() == 48000
-audio, _ = load_audio("02_wpe.wav", sr=df_state.sr())
-save_audio("03_dfn3.wav", enhance(model, df_state, audio), df_state.sr())
-```
-
-### 5. noisereduce suave con los frames más silenciosos
-
-Dividir en frames de 50 ms, calcular RMS, tomar el 10 % más silencioso
-(mínimo ~0.5 s en total) y usarlo como `y_noise`:
-
-```python
-import noisereduce as nr
-frame = int(0.05 * sr)
-n = len(x) // frame
-rms = np.sqrt((x[: n * frame].reshape(n, frame) ** 2).mean(axis=1) + 1e-12)
-k = max(int(n * 0.10), int(0.5 / 0.05))
-idx = np.sort(np.argsort(rms)[:k])
-ruido = np.concatenate([x[i * frame:(i + 1) * frame] for i in idx])
-limpio = nr.reduce_noise(y=x, sr=48000, y_noise=ruido,
-                         stationary=True, prop_decrease=0.5)
-```
-
-### 6. Normalizar a -16 LUFS (dos pasadas)
+Sin poder escuchar, DNSMOS P.835 da una estimación objetiva: **SIG**
+(naturalidad de la voz; baja cuando suena robótica), **BAK** (ruido y voces
+de fondo) y **OVRL** (global), de 1 a 5. Comparar siempre a nivel igualado.
 
 ```bash
-# Pasada 1: medir
-ffmpeg -i 04_nr.wav -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null -
-# Pasada 2: aplicar con los valores medidos (input_i, input_tp, input_lra, input_thresh, target_offset)
-ffmpeg -y -i 04_nr.wav -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=...:measured_TP=...:measured_LRA=...:measured_thresh=...:offset=...:linear=true" \
-  -ar 48000 -c:a pcm_s24le salida.wav
+curl -sSL -o sig_bak_ovr.onnx \
+  https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/DNSMOS/DNSMOS/sig_bak_ovr.onnx
+python .claude/skills/limpiar-audio-voz/scripts/medir_dnsmos.py --modelo sig_bak_ovr.onnx a.wav b.wav
 ```
+
+Referencia (entrevista con dos voces y voces de fondo lejanas, 44.1 kHz
+estéreo): original SIG 1.75 / BAK 1.33; cadena por defecto SIG 2.77 /
+BAK 3.16 / OVRL 2.21 antes de normalizar.
 
 ## Verificación
 
@@ -145,13 +153,18 @@ ffprobe -v error -show_entries stream=sample_rate,channels -of default=nw=1 sali
 ffmpeg -i salida.wav -af ebur128=peak=true -f null - 2>&1 | grep -E "I:|Peak:"         # I ≈ -16 LUFS, pico ≤ -1.5 dBTP
 ```
 
-Escucha siempre el resultado: si la voz suena metálica o "bajo el agua",
-bajar `--nr` (p. ej. 0.3) o desactivar WPE con `--sin-wpe`.
+Escucha siempre el resultado.
 
 ## Problemas frecuentes
 
-- **Zumbido persiste** → comprobar si es de 50 Hz (`--hum 50`) o con más
-  armónicos; añadir notches extra.
-- **Voz con "bombeo" o cortes** → noisereduce demasiado fuerte; bajar `--nr`.
-- **Eco sigue presente** → subir `--wpe-taps` a 15–20.
+- **Voz robótica o "bajo el agua"** → subir la mezcla en seco (`--seco -18`),
+  bajar `--nr` (0.4) o usar `--sin-postfiltro`.
+- **Aún se oyen voces de fondo en las pausas** → `--expander fuerte` (por
+  defecto); si ya está, bajar `--seco` a -24 (la mezcla en seco también trae
+  algo de fondo).
+- **Se cortan los finales de palabra** → `--expander suave`.
+- **Una voz principal queda atenuada** → está muy por debajo de la otra;
+  usar `--expander suave` o `--expander no`.
+- **Eco sigue presente** → subir `--wpe-taps` a 15 (peor timbre por encima).
+- **Zumbido persiste** → comprobar si es de 50 Hz (`--hum 50`).
 - **Salida no está a 48 kHz** → falta `-ar 48000` tras `loudnorm`.
